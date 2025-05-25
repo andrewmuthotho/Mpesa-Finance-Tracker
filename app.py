@@ -13,7 +13,7 @@ from database import create_connection, create_table, insert_transaction, transa
 # --- App Configuration and Styling ---
 st.set_page_config(page_title="Personal Finance Tracker", layout="wide", page_icon="💰")
 
-# Custom CSS for Apple-style minimalist design
+# Custom CSS 
 st.markdown("""
     <style>
     /* Use Apple-like San Francisco font if available */
