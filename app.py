@@ -3,12 +3,18 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
+import json
+import os
 import matplotlib.pyplot as plt
 from io import StringIO, BytesIO
 
 from parser import parse_csv, parse_pdf
-from processor import clean_data, extract_pdf_table
-from database import create_connection, create_table, insert_transaction, transaction_exists, get_transactions, update_transaction_category
+from processor import clean_data
+from database import (
+    create_connection, create_table, insert_transaction, 
+    transaction_exists, get_transactions, update_transaction_category,
+    get_all_categories, add_category_mapping, get_category_mappings
+)
 
 # --- App Configuration and Styling ---
 st.set_page_config(page_title="Personal Finance Tracker", layout="wide", page_icon="💰")
@@ -32,6 +38,63 @@ create_table(conn)
 # --- File Upload and Parsing ---
 st.header("Upload M-Pesa Statement")
 st.write("Upload your M-Pesa statement in CSV or PDF format to add transactions to your tracker.")
+
+# --- Transaction Search & Edit ---
+st.subheader("Add Category")
+
+# Search transactions
+category_file = "categories.json"
+
+if "categories" not in st.session_state:
+    st.session_state.categories = {
+        "Uncategorized": []
+    }
+
+if os.path.exists(category_file):
+    with open(category_file, "r") as f:
+        st.session_state.categories = json.load(f)
+
+def save_categories():
+    with open(category_file, "w") as f:
+        json.dump(st.session_state.categories, f, indent=2)
+
+def categorize_transactions(df):
+    df["Category"] = "Uncategorized"
+
+    for category, keywords in st.session_state.categories.items():
+        if category == "Uncategorized" or not keywords:
+            continue
+
+        lowered_keywords = [keyword.lower().strip() for keyword in keywords]
+
+        for idx, row in df.iterrows():
+            details = row["Description"].lower().strip()
+            if details in lowered_keywords:
+                df.at[idx, "Category"] = category
+        
+    return df
+
+def add_keyword_to_category(category, keyword):
+    """
+    Add a keyword to a category for automatic categorization.
+    """
+    if category not in st.session_state.categories:
+        st.session_state.categories[category] = []
+    
+    if keyword not in st.session_state.categories[category]:
+        st.session_state.categories[category].append(keyword)
+        save_categories()
+
+# Editing category
+new_category = st.text_input("New Category Name")
+add_button = st.button("Add Category")
+
+if add_button and new_category:
+    if new_category not in st.session_state.categories:
+        st.session_state.categories[new_category] = []
+        save_categories()      
+        st.rerun()
+
 uploaded_file = st.file_uploader("Choose a CSV or PDF file", type=['csv', 'pdf'])
 if uploaded_file:
     try:
@@ -44,13 +107,41 @@ if uploaded_file:
         
         # Clean and categorize
         clean_df = clean_data(raw_df)
-        st.write("Parsed transactions preview:")
-        st.dataframe(clean_df.head(10))
+        st.session_state.clean_df = clean_df.copy()  
+
+        st.subheader("Categorized Transactions")
+        edited_df = st.data_editor(
+            st.session_state.clean_df[["Date", "Time", "Description", "Amount", "Category"]],
+            column_config={
+                'Date': st.column_config.TextColumn("Date"),
+                'Time': st.column_config.TextColumn("Time"),
+                'Description': st.column_config.TextColumn("Description"),
+                'Amount': st.column_config.NumberColumn("Amount", format="%.2f Ksh"),
+                'Category': st.column_config.SelectboxColumn(
+                    "Category",
+                    options=list(st.session_state.categories.keys())
+                )
+            },
+            hide_index=True,
+            use_container_width=True,
+            key="category_editor"
+        ) 
         
+        save_button = st.button("Save Changes", type ="primary")
+        if save_button:
+            for idx, row in edited_df.iterrows():
+                new_category = row["Category"] 
+                if new_category == st.session_state.clean_df.at[idx, "Category"]:
+                    continue 
+
+                details = row["Description"]
+                st.session_state.clean_df.at[idx, "Category"] = new_category
+                add_keyword_to_category(new_category, details) 
+
         # Insert into DB (skipping duplicates)
         new_count = 0
-        for _, row in clean_df.iterrows():
-            receipt_no = row.get('Receipt No', '') or row.get('Transaction ID', '') or str(row['time'])
+        for _, row in edited_df.iterrows():
+            receipt_no = row.get('Receipt No', '') or row.get('Transaction ID', '') or f"TXN_{row.name}_{row['Date']}"
             date = str(row['Date'])
             amount = row['Amount']
             if not transaction_exists(conn, receipt_no, date, amount):
@@ -60,26 +151,75 @@ if uploaded_file:
     except Exception as e:
         st.error(f"Error parsing file: {e}")
 
-# --- Transaction Search & Edit ---
-st.header("View and Edit Transactions")
+# --- All Transactions Tab ---
+st.header("All Transactions Tab")
 
-search_input = st.text_input("Search by description or transaction ID")
-results = get_transactions(conn, search_input) if search_input else get_transactions(conn)
-if results:
-    df_results = pd.DataFrame(results, columns=['receipt_no', 'date', 'time', 'description', 'amount', 'category'])
-    st.write(f"Found {len(df_results)} transactions.")
-    st.dataframe(df_results)
+# Fetch all transactions from database
+all_transactions = get_transactions(conn)
+if all_transactions:
+    # Convert to DataFrame
+    df_all = pd.DataFrame(all_transactions, columns=['receipt_no', 'date', 'time', 'description', 'amount', 'category'])
+    
+    # Convert date to datetime for analysis and display only date part
+    df_all['date'] = pd.to_datetime(df_all['date'], errors='coerce').dt.date
+    
+    # Editable table for category update
+    st.subheader("Edit Categories for Existing Transactions")
+    edited_db_df = st.data_editor(
+        df_all[['receipt_no', 'date', 'time', 'description', 'amount', 'category']],
+        column_config={
+            'category': st.column_config.SelectboxColumn(
+                "Category",
+                options=list(st.session_state.categories.keys())
+            )
+        },
+        hide_index=True,
+        use_container_width=True,
+        height=250,
+        key="db_category_editor"
+    )
+    
+    # Save button for DB category edits
+    save_db_button = st.button("Save Category Changes to Database", type="primary", key="save_db_btn")
+    if save_db_button:
+        for idx, row in edited_db_df.iterrows():
+            receipt_no = row['receipt_no']
+            new_category = row['category']
+            if new_category != df_all.at[idx, 'category']:
+                update_transaction_category(conn, receipt_no, new_category)
+                # Add the description as a keyword to the category
+                description = row['description']
+                add_keyword_to_category(new_category, description)
+                # Auto-categorize other transactions in the database with the same description
+                for j, other_row in df_all.iterrows():
+                    if j != idx and other_row['description'] == description and other_row['category'] != new_category:
+                        update_transaction_category(conn, other_row['receipt_no'], new_category)
+        st.success("Categories updated in the database.")
+        st.rerun()
 
-    # Editing category
-    st.subheader("Edit Transaction Category")
-    receipt_no_to_edit = st.text_input("Enter Transaction ID to update")
-    new_cat = st.text_input("New Category")
-    if st.button("Update Category"):
-        if receipt_no_to_edit and new_cat:
-            update_transaction_category(conn, receipt_no_to_edit, new_cat)
-            st.success(f"Updated category of {receipt_no_to_edit} to {new_cat}.")
-        else:
-            st.error("Please provide both Transaction ID and new category.")
+    # Display all transactions with scrolling (smaller height)
+    st.write(f"Total transactions in database: {len(df_all)}")
+    # st.dataframe(df_all, use_container_width=True, height=250)  # Removed as per user request
+    
+    # --- Summary Tab: Filter by Category and Date ---
+    st.subheader("Summary: Filter by Category and Date")
+    with st.expander("Show Category & Date Filter"):
+        all_categories = sorted(df_all['category'].unique())
+        selected_categories = st.multiselect("Select categories to view spending:", all_categories, default=all_categories)
+        min_date = df_all['date'].min()
+        max_date = df_all['date'].max()
+        date_range = st.date_input("Select date range:", [min_date, max_date], min_value=min_date, max_value=max_date)
+    
+    # Filter data
+    filtered = df_all[(df_all['category'].isin(selected_categories)) &
+                      (df_all['date'] >= date_range[0]) &
+                      (df_all['date'] <= date_range[1]) &
+                      (df_all['amount'] < 0)]
+    filtered['amount'] = filtered['amount'].abs()
+    st.write(f"Total spent in selected categories and date range: KSH {filtered['amount'].sum():,.2f}")
+    st.dataframe(filtered[['date', 'description', 'amount', 'category']], use_container_width=True, height=250)
+else:
+    st.info("No transactions found in database. Upload a statement to get started.")
 
 # --- Charts and Downloads ---
 st.header("Spending Trends & Reports")
@@ -90,27 +230,21 @@ if not all_data.empty:
     # Convert 'date' to datetime for grouping
     all_data['date'] = pd.to_datetime(all_data['date'])
     
-    # Interactive Trend Chart (monthly spending)
-    st.subheader("Monthly Spending Trend")
-    monthly = all_data.set_index('date').resample('M')['amount'].sum().reset_index()
-    chart = alt.Chart(monthly).mark_line(point=True).encode(
-        x=alt.X('date:T', title='Month'),
-        y=alt.Y('amount:Q', title='Net Amount'),
-        tooltip=[alt.Tooltip('date:T', title='Month'), alt.Tooltip('amount:Q', title='Net Total')]
-    ).properties(width=600, height=300)
-    st.altair_chart(chart, use_container_width=True)
-
-    # Interactive Category Breakdown (only expenses)
-    st.subheader("Category Breakdown (Expenses)")
-    exp_data = all_data[all_data['amount'] < 0]
+    # --- Interactive Pie Chart: Spending by Category (Expenses Only) ---
+    st.subheader("Spending by Category (Interactive Pie Chart)")
+    exp_data = all_data[all_data['amount'] < 0].copy()
+    exp_data['amount'] = exp_data['amount'].abs()
     if not exp_data.empty:
         cat_sum = exp_data.groupby('category')['amount'].sum().reset_index()
-        bar_chart = alt.Chart(cat_sum).mark_bar(color='#4c78a8').encode(
-            x=alt.X('category:N', sort='-y', title='Category'),
-            y=alt.Y('amount:Q', title='Total Spent'),
-            tooltip=[alt.Tooltip('category:N', title='Category'), alt.Tooltip('amount:Q', title='Total')]
-        ).properties(width=600, height=300)
-        st.altair_chart(bar_chart, use_container_width=True)
+        cat_sum = cat_sum[cat_sum['amount'] > 0]
+        pie_chart = alt.Chart(cat_sum).mark_arc(innerRadius=50).encode(
+            theta=alt.Theta(field="amount", type="quantitative"),
+            color=alt.Color(field="category", type="nominal"),
+            tooltip=[alt.Tooltip('category:N', title='Category'), alt.Tooltip('amount:Q', title='Total Spent')]
+        ).properties(width=500, height=400, title='Expenses by Category')
+        st.altair_chart(pie_chart, use_container_width=True)
+    else:
+        st.info("No expenses available for pie chart.")
 
     # Downloadable cleaned data CSV
     csv_buffer = StringIO()
@@ -120,9 +254,9 @@ if not all_data.empty:
     # Downloadable charts as PNG
     # Spending Trend PNG
     fig1, ax1 = plt.subplots()
-    monthly_plot = monthly.copy()
-    monthly_plot['Month'] = monthly_plot['date'].dt.strftime('%Y-%m')
-    ax1.plot(monthly_plot['Month'], monthly_plot['amount'], marker='o')
+    monthly = all_data.set_index('date').resample('M')['amount'].sum().reset_index()
+    monthly['Month'] = monthly['date'].dt.strftime('%Y-%m')
+    ax1.plot(monthly['Month'], monthly['amount'], marker='o')
     ax1.set_title("Monthly Spending Trend")
     ax1.set_xlabel("Month")
     ax1.set_ylabel("Net Amount")
@@ -131,17 +265,5 @@ if not all_data.empty:
     fig1.savefig(buf1, format="png")
     buf1.seek(0)
     st.download_button("Download Trend Chart (PNG)", buf1, "trend.png", "image/png")
-    
-    # Category Breakdown PNG
-    if not exp_data.empty:
-        fig2, ax2 = plt.subplots()
-        categories = cat_sum['category']
-        totals = -cat_sum['amount']  # make positives for pie
-        ax2.pie(totals, labels=categories, autopct='%1.1f%%', startangle=90, colors=plt.cm.Paired.colors)
-        ax2.set_title("Expenses by Category")
-        buf2 = BytesIO()
-        fig2.savefig(buf2, format="png")
-        buf2.seek(0)
-        st.download_button("Download Category Chart (PNG)", buf2, "categories.png", "image/png")
 else:
     st.info("No transactions available to display charts.")

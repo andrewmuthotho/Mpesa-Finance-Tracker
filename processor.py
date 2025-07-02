@@ -1,5 +1,6 @@
 import pandas as pd
 import pdfplumber
+from database import get_category_for_description
 
 def clean_data(df):
     if 'Completion Time' in df.columns:
@@ -29,5 +30,8 @@ def clean_data(df):
         if col in df.columns:
             df = df.drop(columns=col)
     
-    df['Category'] = ''
+    # Apply category mappings
+    df['Category'] = df['Description'].apply(lambda x: get_category_for_description(x))
     return df
+    
+    

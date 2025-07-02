@@ -1,6 +1,9 @@
 # database.py
 
 import sqlite3
+import json
+import os
+import pandas as pd
 
 DB_NAME = "transactions.db"
 
@@ -71,3 +74,64 @@ def update_transaction_category(conn, receipt_no, new_category):
     sql = "UPDATE transactions SET category = ? WHERE receipt_no = ?"
     conn.execute(sql, (new_category, receipt_no))
     conn.commit()
+
+def get_all_categories():
+    """
+    Get all available categories from categories.json.
+    """
+    category_file = "categories.json"
+    if os.path.exists(category_file):
+        with open(category_file, "r") as f:
+            categories = json.load(f)
+        return list(categories.keys())
+    return ["Uncategorized"]
+
+def add_category_mapping(category, keywords):
+    """
+    Add or update category mappings in categories.json.
+    """
+    category_file = "categories.json"
+    if os.path.exists(category_file):
+        with open(category_file, "r") as f:
+            categories = json.load(f)
+    else:
+        categories = {"Uncategorized": []}
+    
+    categories[category] = keywords
+    
+    with open(category_file, "w") as f:
+        json.dump(categories, f, indent=2)
+
+def get_category_mappings():
+    """
+    Get all category mappings from categories.json.
+    """
+    category_file = "categories.json"
+    if os.path.exists(category_file):
+        with open(category_file, "r") as f:
+            return json.load(f)
+    return {"Uncategorized": []}
+
+def get_category_for_description(description):
+    """
+    Get the appropriate category for a transaction description.
+    Uses category mappings from categories.json.
+    """
+    if not description or pd.isna(description):
+        return "Uncategorized"
+    
+    description = str(description).lower()
+    
+    # Load category mappings
+    category_mappings = get_category_mappings()
+    
+    # Check each category's keywords
+    for category, keywords in category_mappings.items():
+        if category == "Uncategorized":
+            continue
+        for keyword in keywords:
+            if keyword.lower() in description:
+                return category
+    
+    return "Uncategorized"
+
